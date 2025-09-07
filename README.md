@@ -1,0 +1,3 @@
+# CoreStake
+
+CoreStake is a skill-based blockchain mining simulation game where players extract digital resources from procedurally generated planetary core layers using degradable NFT equipment, combining geological authenticity with sustainable tokenomics. The platform utilizes a dual-layer architecture for seamless gameplay and implements community governance through CORE token staking, creating educational partnerships with universities while maintaining economic balance through deflationary mechanics and multiple revenue streams.
