@@ -17,6 +17,8 @@
 (define-constant ERR-MINER-ALREADY-EXISTS (err u112))
 (define-constant ERR-CORE-LAYER-NOT-FOUND (err u113))
 (define-constant ERR-PROPOSAL-NOT-FOUND (err u114))
+(define-constant ERR-EQUIPMENT-NOT-FOUND (err u115))
+(define-constant ERR-INSUFFICIENT-DURABILITY (err u116))
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -24,6 +26,7 @@
 (define-constant MIN-STAKING-AMOUNT u1000000) ;; 1 STX minimum
 (define-constant MAX-CORE-LAYERS u10)
 (define-constant GOVERNANCE-THRESHOLD u1000)
+(define-constant EQUIPMENT-DEGRADATION-RATE u5)
 
 ;; Data Variables
 (define-data-var total-resources-extracted uint u0)
@@ -150,6 +153,15 @@
   }
 )
 
+(define-map miner-equipment-assignments
+  { miner-id: uint }
+  {
+    equipment-id: uint,
+    assignment-date: uint,
+    total-extractions: uint
+  }
+)
+
 ;; Private Functions
 (define-private (calculate-dynamic-extraction (planet-id uint) (base-amount uint))
   (let (
@@ -196,6 +208,32 @@
 (define-private (validate-geological-verification (extraction-difficulty uint) (geological-hash (optional (buff 32))))
   (if (is-eq extraction-difficulty u1)
     (is-some geological-hash)
+    true
+  )
+)
+
+(define-private (calculate-equipment-efficiency (equipment-id uint) (usage-count uint))
+  (let (
+    (equipment (unwrap! (map-get? mining-equipment { equipment-id: equipment-id }) u100))
+    (degradation (/ (* usage-count EQUIPMENT-DEGRADATION-RATE) u100))
+    (current-efficiency (get current-efficiency equipment))
+  )
+    (if (> degradation current-efficiency)
+      u0
+      (- current-efficiency degradation)
+    )
+  )
+)
+
+(define-private (degrade-equipment (equipment-id uint))
+  (let (
+    (equipment (unwrap! (map-get? mining-equipment { equipment-id: equipment-id }) false))
+    (new-efficiency (calculate-equipment-efficiency equipment-id u1))
+  )
+    (map-set mining-equipment
+      { equipment-id: equipment-id }
+      (merge equipment { current-efficiency: new-efficiency })
+    )
     true
   )
 )
@@ -403,4 +441,293 @@
   (layer-id uint)
   (geological-hash (optional (buff 32))))
   (begin
-    (asserts! (not (var-get emergency-pause)) ERR-NOT-
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    
+    (let (
+      (planet (unwrap! (map-get? mining-planets { planet-id: planet-id }) ERR-PLANET-NOT-FOUND))
+      (core-layer (unwrap! (map-get? core-layers { planet-id: planet-id, layer-id: layer-id }) ERR-CORE-LAYER-NOT-FOUND))
+    )
+      (asserts! (is-eq tx-sender (get discoverer planet)) ERR-NOT-AUTHORIZED)
+      (asserts! (get active planet) ERR-PLANET-NOT-FOUND)
+      (asserts! (not (get extracted core-layer)) ERR-ALREADY-EXTRACTED)
+      (asserts! (validate-geological-verification (get extraction-difficulty core-layer) geological-hash) ERR-EXTRACTION-FAILED)
+      
+      (map-set core-layers
+        { planet-id: planet-id, layer-id: layer-id }
+        (merge core-layer {
+          extracted: true,
+          geological-hash: geological-hash,
+          extraction-date: (some block-height)
+        })
+      )
+      
+      ;; Transfer extracted resources
+      (try! (as-contract (stx-transfer? (get resource-amount core-layer) tx-sender (get discoverer planet))))
+      (update-skill-score (get discoverer planet) u50)
+      (ok true)
+    )
+  )
+)
+
+(define-public (create-mining-equipment 
+  (planet-id uint) 
+  (durability-amount uint)
+  (expected-degradation-rate uint))
+  (let (
+    (equipment-id (var-get next-equipment-id))
+  )
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    (asserts! (verify-fraud-check tx-sender) ERR-FRAUD-DETECTED)
+    (asserts! (> durability-amount u0) ERR-INVALID-AMOUNT)
+    
+    (let (
+      (planet (unwrap! (map-get? mining-planets { planet-id: planet-id }) ERR-PLANET-NOT-FOUND))
+    )
+      (asserts! (get active planet) ERR-PLANET-NOT-FOUND)
+      
+      (map-set mining-equipment
+        { equipment-id: equipment-id }
+        {
+          owner: tx-sender,
+          planet-id: planet-id,
+          durability-amount: durability-amount,
+          expected-degradation-rate: expected-degradation-rate,
+          maintenance-layers: u0,
+          current-efficiency: u100
+        }
+      )
+      (var-set next-equipment-id (+ equipment-id u1))
+      (update-skill-score tx-sender u20)
+      (ok equipment-id)
+    )
+  )
+)
+
+(define-public (assign-equipment-to-miner (miner-id uint) (equipment-id uint))
+  (begin
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    
+    (let (
+      (miner (unwrap! (map-get? miners { miner-id: miner-id }) ERR-MINER-NOT-FOUND))
+      (equipment (unwrap! (map-get? mining-equipment { equipment-id: equipment-id }) ERR-EQUIPMENT-NOT-FOUND))
+    )
+      (asserts! (is-eq tx-sender (get wallet miner)) ERR-NOT-AUTHORIZED)
+      (asserts! (is-eq tx-sender (get owner equipment)) ERR-NOT-AUTHORIZED)
+      (asserts! (get active miner) ERR-MINER-NOT-FOUND)
+      (asserts! (> (get current-efficiency equipment) u0) ERR-INSUFFICIENT-DURABILITY)
+      
+      (map-set miner-equipment-assignments
+        { miner-id: miner-id }
+        {
+          equipment-id: equipment-id,
+          assignment-date: block-height,
+          total-extractions: u0
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (perform-extraction-with-equipment (miner-id uint) (planet-id uint) (layer-id uint))
+  (begin
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    
+    (let (
+      (miner (unwrap! (map-get? miners { miner-id: miner-id }) ERR-MINER-NOT-FOUND))
+      (assignment (unwrap! (map-get? miner-equipment-assignments { miner-id: miner-id }) ERR-EQUIPMENT-NOT-FOUND))
+      (equipment (unwrap! (map-get? mining-equipment { equipment-id: (get equipment-id assignment) }) ERR-EQUIPMENT-NOT-FOUND))
+      (core-layer (unwrap! (map-get? core-layers { planet-id: planet-id, layer-id: layer-id }) ERR-CORE-LAYER-NOT-FOUND))
+    )
+      (asserts! (is-eq tx-sender (get wallet miner)) ERR-NOT-AUTHORIZED)
+      (asserts! (get active miner) ERR-MINER-NOT-FOUND)
+      (asserts! (not (get extracted core-layer)) ERR-ALREADY-EXTRACTED)
+      (asserts! (> (get current-efficiency equipment) u10) ERR-INSUFFICIENT-DURABILITY)
+      (asserts! (is-eq planet-id (get planet-id equipment)) ERR-PLANET-NOT-FOUND)
+      
+      ;; Calculate extraction success based on equipment efficiency and miner skill
+      (let (
+        (extraction-bonus (/ (* (get current-efficiency equipment) (get equipment-tier miner)) u100))
+        (resource-extracted (/ (* (get resource-amount core-layer) extraction-bonus) u100))
+      )
+        ;; Mark layer as extracted
+        (map-set core-layers
+          { planet-id: planet-id, layer-id: layer-id }
+          (merge core-layer {
+            extracted: true,
+            extraction-date: (some block-height)
+          })
+        )
+        
+        ;; Update miner stats
+        (map-set miners
+          { miner-id: miner-id }
+          (merge miner {
+            total-resources: (+ (get total-resources miner) resource-extracted),
+            completed-extractions: (+ (get completed-extractions miner) u1)
+          })
+        )
+        
+        ;; Degrade equipment
+        (degrade-equipment (get equipment-id assignment))
+        
+        ;; Update assignment stats
+        (map-set miner-equipment-assignments
+          { miner-id: miner-id }
+          (merge assignment {
+            total-extractions: (+ (get total-extractions assignment) u1)
+          })
+        )
+        
+        ;; Transfer resources to miner
+        (try! (as-contract (stx-transfer? resource-extracted tx-sender (get wallet miner))))
+        (update-skill-score (get wallet miner) u75)
+        (ok resource-extracted)
+      )
+    )
+  )
+)
+
+(define-public (create-governance-proposal 
+  (proposal-type uint) 
+  (target-id uint) 
+  (voting-duration uint))
+  (let (
+    (proposal-id (var-get next-proposal-id))
+    (user-score (default-to 
+      { score: u0, core-tokens: u0, extraction-count: u0, equipment-reports: u0 }
+      (map-get? miner-skill-scores { user: tx-sender })))
+  )
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (get core-tokens user-score) GOVERNANCE-THRESHOLD) ERR-NOT-AUTHORIZED)
+    (asserts! (<= proposal-type u3) ERR-INVALID-TIER)
+    (asserts! (>= proposal-type u1) ERR-INVALID-TIER)
+    
+    (map-set governance-proposals
+      { proposal-id: proposal-id }
+      {
+        proposer: tx-sender,
+        proposal-type: proposal-type,
+        target-id: target-id,
+        votes-for: u0,
+        votes-against: u0,
+        voting-deadline: (+ block-height voting-duration),
+        executed: false
+      }
+    )
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)
+  )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
+  (begin
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    
+    (let (
+      (proposal (unwrap! (map-get? governance-proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (user-score (default-to 
+        { score: u0, core-tokens: u0, extraction-count: u0, equipment-reports: u0 }
+        (map-get? miner-skill-scores { user: tx-sender })))
+      (voting-power (get core-tokens user-score))
+    )
+      (asserts! (< block-height (get voting-deadline proposal)) ERR-VOTING-CLOSED)
+      (asserts! (> voting-power u0) ERR-NOT-AUTHORIZED)
+      
+      (if vote-for
+        (map-set governance-proposals
+          { proposal-id: proposal-id }
+          (merge proposal { votes-for: (+ (get votes-for proposal) voting-power) }))
+        (map-set governance-proposals
+          { proposal-id: proposal-id }
+          (merge proposal { votes-against: (+ (get votes-against proposal) voting-power) }))
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (repair-equipment (equipment-id uint) (repair-amount uint))
+  (begin
+    (asserts! (not (var-get emergency-pause)) ERR-NOT-AUTHORIZED)
+    (asserts! (> repair-amount u0) ERR-INVALID-AMOUNT)
+    
+    (let (
+      (equipment (unwrap! (map-get? mining-equipment { equipment-id: equipment-id }) ERR-EQUIPMENT-NOT-FOUND))
+      (repair-cost (/ (* repair-amount u1000) u100))
+    )
+      (asserts! (is-eq tx-sender (get owner equipment)) ERR-NOT-AUTHORIZED)
+      (try! (stx-transfer? repair-cost tx-sender (as-contract tx-sender)))
+      
+      (let (
+        (calculated-efficiency (+ (get current-efficiency equipment) repair-amount))
+        (new-efficiency (if (> calculated-efficiency u100) u100 calculated-efficiency))
+      )
+        (map-set mining-equipment
+          { equipment-id: equipment-id }
+          (merge equipment { 
+            current-efficiency: new-efficiency,
+            maintenance-layers: (+ (get maintenance-layers equipment) u1)
+          })
+        )
+        (update-skill-score tx-sender u10)
+        (ok new-efficiency)
+      )
+    )
+  )
+)
+
+;; Read-only Functions
+(define-read-only (get-miner (miner-id uint))
+  (map-get? miners { miner-id: miner-id })
+)
+
+(define-read-only (get-planet (planet-id uint))
+  (map-get? mining-planets { planet-id: planet-id })
+)
+
+(define-read-only (get-core-layer (planet-id uint) (layer-id uint))
+  (map-get? core-layers { planet-id: planet-id, layer-id: layer-id })
+)
+
+(define-read-only (get-equipment (equipment-id uint))
+  (map-get? mining-equipment { equipment-id: equipment-id })
+)
+
+(define-read-only (get-miner-equipment (miner-id uint))
+  (map-get? miner-equipment-assignments { miner-id: miner-id })
+)
+
+(define-read-only (get-user-skill-score (user principal))
+  (map-get? miner-skill-scores { user: user })
+)
+
+(define-read-only (get-platform-stats)
+  {
+    total-resources-extracted: (var-get total-resources-extracted),
+    total-miners-active: (var-get total-miners-active),
+    platform-treasury: (var-get platform-treasury),
+    core-token-supply: (var-get core-token-supply),
+    emergency-pause: (var-get emergency-pause)
+  }
+)
+
+(define-read-only (get-staking-contribution (staker principal) (planet-id uint))
+  (map-get? staking-contributions { staker: staker, planet-id: planet-id })
+)
+
+(define-read-only (get-sector-data (sector (string-ascii 50)))
+  (map-get? sector-data { sector: sector })
+)
+
+(define-read-only (get-guild-verification (guild-id (string-ascii 50)))
+  (map-get? verified-guilds { guild-id: guild-id })
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? governance-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-fraud-check (user principal))
+  (map-get? anti-fraud-checks { user: user })
+)
